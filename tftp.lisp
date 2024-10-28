@@ -185,7 +185,7 @@
    (src-port :initarg :src-port :initform (find-port) :accessor src-port)
    (dst-port :initarg :dst-port :initform 69 :accessor dst-port)
    (packet :initform (make-array (+ 512 4) :element-type '(unsigned-byte 8)) :accessor packet)
-   (stream :accessor stream)))
+   (output :accessor output)))
 
 (defmethod initialize-instance :after ((client client) &key host (port (dst-port client)))
   (cond ((slot-boundp client 'socket)
@@ -196,17 +196,17 @@
          (setf (socket client) (usocket:socket-connect host port :protocol :datagram :local-port (src-port client))))))
 
 (defmethod close ((client client) &key abort)
-  (when (slot-boundp client 'stream)
-    (close stream :abort abort)
-    (slot-makunbound client 'stream))
+  (when (slot-boundp client 'output)
+    (close output :abort abort)
+    (slot-makunbound client 'output))
   (when (slot-boundp client 'socket)
     (usocket:socket-close (socket client))
     (slot-makunbound client 'socket)))
 
-(defmethod send ((client client) size)
+(defmethod send ((client client) size &key)
   (usocket:socket-send (socket client) (packet client) size))
 
-(defmethod send ((client client) (retransmit null))
+(defmethod send ((client client) (retransmit null) &key)
   (usocket:socket-send (socket client) (packet client) size))
 
 (defmethod fail ((client client) code message &rest args)
@@ -277,14 +277,14 @@
       (fail client :illegal-operation "Bad block number in ACK, expected ~d but got ~d" (blocknr client) blocknr))
     (setf (block-opcode packet) :data)
     (setf (block-blocknr packet) (incf (blocknr client)))
-    (let ((end (read-sequence packet (stream client) :start 4 :end (+ 4 (block-size packet)))))
+    (let ((end (read-sequence packet (output client) :start 4 :end (+ 4 (block-size packet)))))
       (send client end))))
 
 (defmethod handle-packet ((client client) (op (eql :data)) packet end)
   (let ((blocknr (packet-blocknr packet)))
     (when (/= blocknr (1+ (blocknr client)))
       (fail client :illegal-operation "Bad block number in DATA, expected ~d but got ~d" (1+ (blocknr client)) blocknr))
-    (write-sequence packet (stream client) :start 4 :end end)
+    (write-sequence packet (output client) :start 4 :end end)
     (setf (packet-opcode packet) :ack)
     (setf (packet-blocknr packet) (incf (blocknr client)))
     (send client 4)
@@ -297,7 +297,7 @@
              (stream (open path :direction :input :element-type '(unsigned-byte 8) :if-does-not-exist NIL)))
         (unless stream
           (fail client :file-not-found "No such file ~a" filename))
-        (setf (stream client) stream)
+        (setf (output client) stream)
         ;; The fake ACK will cause the transfer to start.
         (handle-packet client :ack #(0 0 0 0) 4))
     (file-error ()
@@ -309,7 +309,7 @@
              (stream (open path :direction :output :element-type '(unsigned-byte 8) :if-exists NIL)))
         (unless stream
           (fail client :file-exists "The file already exists at ~a" filename))
-        (setf (stream client) stream)
+        (setf (output client) stream)
         (setf (packet-opcode packet) :ack)
         (setf (packet-blocknr packet) 0)
         (send client 4))
