@@ -132,23 +132,44 @@
    (message :initarg :message :reader message))
   (:report (lambda (c s) (format s "~@[~a: ~]~a" (code c) (message c)))))
 
-(defclass server ()
+(defclass socket-object ()
+  ((socket :initarg :socket :accessor socket)
+   (verbose :initarg :verbose :initform NIL :accessor verbose)))
+
+(defmethod host ((object socket-object))
+  (usocket:host-to-hostname
+   (usocket:get-local-address (socket object))))
+
+(defmethod port ((object socket-object))
+  (usocket:get-local-port (socket object)))
+
+(defmethod log ((object socket-object) format &rest args)
+  (when (verbose object)
+    (if (slot-boundp object 'socket)
+        (format *error-output* "~&TFTP ~a:~a> ~?~%" (host object) (port object) format args)
+        (format *error-output* "~&TFTP CLOSED> ~?~%" format args))))
+
+(defmethod close ((object socket-object) &key abort)
+  (declare (ignore abort))
+  (when (slot-boundp object 'socket)
+    (log object "Closing")
+    (usocket:socket-close (socket object))
+    (slot-makunbound object 'socket))
+  object)
+
+(defclass server (socket-object)
   ((root :initarg :root :initform (make-pathname :directory '(:absolute)) :accessor root)
-   (clients :initform () :accessor clients)
-   (socket :initarg :socket :accessor socket)))
+   (clients :initform () :accessor clients)))
 
 (defmethod shared-initialize :after ((server server) slots &key (host "0.0.0.0") (port 69))
   (unless (slot-boundp server 'socket)
-    (setf (socket server) (usocket:socket-connect NIL NIL :protocol :datagram :local-host host :local-port port))))
+    (setf (socket server) (usocket:socket-connect NIL NIL :protocol :datagram :local-host host :local-port port))
+    (log server "Listening for connections")))
 
-(defmethod close ((server server) &key abort)
-  (when (slot-boundp server 'socket)
-    (usocket:socket-close (socket server))
-    (slot-makunbound server 'socket))
+(defmethod close :after ((server server) &key abort)
   (when abort
     (mapc #'close (clients server))
-    (setf (clients server) ()))
-  server)
+    (setf (clients server) ())))
 
 (defmethod serve ((server server) &key (timeout 0))
   (let ((sockets ()))
@@ -160,7 +181,9 @@
              (process (timeout)
                (dolist (socket (usocket:wait-for-input (build-socket-list) :timeout timeout))
                  (if (eql socket (socket server))
-                     (let ((client (make-instance 'client :socket (socket server) :root (root server))))
+                     (let ((client (make-instance 'client :socket (socket server)
+                                                          :root (root server)
+                                                          :verbose (verbose server))))
                        (push client (clients server))
                        (push (socket client) sockets))
                      (let ((client (find socket (clients server) :key #'socket)))
@@ -174,9 +197,8 @@
           (process timeout))
       server)))
 
-(defclass client ()
+(defclass client (socket-object)
   ((root :initarg :root :initform (make-pathname :directory '(:absolute)) :accessor root)
-   (socket :initarg :socket :accessor socket)
    (blocknr :initform 0 :accessor blocknr)
    (block-size :initform 512 :accessor block-size)
    (transfer-size :initform NIL :accessor transfer-size)
@@ -188,20 +210,25 @@
 
 (defmethod initialize-instance :after ((client client) &key host (port (dst-port client)))
   (cond ((slot-boundp client 'socket)
+         (log client "Accepted remote connection")
          ;; We are in receiving client mode. Handle the connection now.
-         (serve connection))
+         (serve client))
         (T
          ;; We are in initiating client mode. Create a socket and wait for the user to initiate a request.
-         (setf (socket client) (usocket:socket-connect host port :protocol :datagram :local-port (src-port client))))))
+         (setf (socket client) (usocket:socket-connect host port :protocol :datagram :local-port (src-port client)))
+         (log client "Connected to server"))))
 
-(defmethod close ((client client) &key abort)
+(defmethod close :before ((client client) &key abort)
   (when (slot-boundp client 'output)
     (close (output client) :abort abort)
-    (slot-makunbound client 'output))
-  (when (slot-boundp client 'socket)
-    (usocket:socket-close (socket client))
-    (slot-makunbound client 'socket))
-  client)
+    (slot-makunbound client 'output)))
+
+(defmethod host ((object client))
+  (usocket:host-to-hostname
+   (usocket:get-peer-address (socket object))))
+
+(defmethod port ((object client))
+  (usocket:get-peer-port (socket object)))
 
 (defmethod send ((client client) size)
   (usocket:socket-send (socket client) (packet client) size))
@@ -212,6 +239,7 @@
     (setf (packet-opcode packet) :error)
     (setf (packet-error-code packet) code)
     (send client (nth-value 1 (setf (packet-error-message packet) message)))
+    (log client "Failed: ~a" message)
     (close client)
     (error 'tftp-error :code code :message message)))
 
@@ -248,6 +276,7 @@
              (:transfer-size (setf (transfer-size client) value))
              (:block-size (setf (block-size client) value))
              ((NIL))))
+  (log client "Negotiated for~{ ~a: ~a~^,~}" options)
   (when ack
     (let ((packet (packet client)))
       (setf (packet-opcode packet) :oack)
@@ -257,6 +286,7 @@
   (destructuring-bind (filename mode . options) (packet-strings packet :end end)
     (case (mode-code mode)
       (:mail (fail client :illegal-operation "Mail transfer mode is unsupported.")))
+    (log client "Read request for ~a" filename)
     (handle-options client options :ack T)
     (handle-packet client op filename mode)))
 
@@ -264,11 +294,12 @@
   (destructuring-bind (filename mode . options) (packet-strings packet :end end)
     (case (mode-code mode)
       (:mail (fail client :illegal-operation "Mail transfer mode is unsupported.")))
+    (log client "Write request for ~a" filename)
     (handle-options client options :ack T)
     (handle-packet client op filename mode)))
 
 (defmethod handle-packet ((client client) (op (eql :oack)) packet end)
-  (handle-options client (packet-strings packet 2))
+  (handle-options client (packet-strings packet))
   (setf (packet-opcode packet) :ack)
   (setf (packet-blocknr packet) 0)
   (send client 4))
@@ -282,10 +313,11 @@
   (let ((blocknr (packet-blocknr packet)))
     (when (/= blocknr (blocknr client))
       (fail client :illegal-operation "Bad block number in ACK, expected ~d but got ~d" (blocknr client) blocknr))
-    (setf (block-opcode packet) :data)
-    (setf (block-blocknr packet) (incf (blocknr client)))
+    (setf (packet-opcode packet) :data)
+    (setf (packet-blocknr packet) (incf (blocknr client)))
     (let ((end (read-sequence packet (output client) :start 4 :end (+ 4 (block-size packet)))))
-      (send client end))))
+      (send client end)
+      (log client "Sent block of ~d bytes" (- end 4)))))
 
 (defmethod handle-packet ((client client) (op (eql :data)) packet end)
   (let ((blocknr (packet-blocknr packet)))
@@ -295,6 +327,7 @@
     (setf (packet-opcode packet) :ack)
     (setf (packet-blocknr packet) (incf (blocknr client)))
     (send client 4)
+    (log client "Received block of ~d bytes" (- end 4))
     (when (< (- end 4) (block-size client))
       (close client))))
 
@@ -313,7 +346,8 @@
 (defmethod handle-packet ((client client) (op (eql :wrq)) (filename string) mode)
   (handler-case
       (let* ((path (merge-pathnames filename (root client)))
-             (stream (open path :direction :output :element-type '(unsigned-byte 8) :if-exists NIL)))
+             (stream (open path :direction :output :element-type '(unsigned-byte 8) :if-exists NIL))
+             (packet (packet client)))
         (unless stream
           (fail client :file-exists "The file already exists at ~a" filename))
         (setf (output client) stream)
@@ -327,7 +361,7 @@
   (let ((packet (packet client)))
     (setf (timeout client) timeout)
     (setf (packet-opcode packet) :wrq)
-    (let* ((start (nth-value 1 (setf (packet-strings packet) (list* filename "octet"))))
+    (let* ((start (nth-value 1 (setf (packet-strings packet) (list filename "octet"))))
            (options (list :transfer-size (when (typep src 'file-stream) (file-length src))
                           :block-size (or block-size (- 4 (length packet)))
                           :timeout (timeout client))))
@@ -341,7 +375,7 @@
   (let ((packet (packet client)))
     (setf (timeout client) timeout)
     (setf (packet-opcode packet) :rrq)
-    (let ((start (nth-value 1 (setf (packet-strings packet) (list* filename "octet"))))
+    (let ((start (nth-value 1 (setf (packet-strings packet) (list filename "octet"))))
           (options (list :transfer-size 0
                          :block-size (or block-size (- 4 (length packet)))
                          :timeout (timeout client))))
